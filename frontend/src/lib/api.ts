@@ -996,6 +996,32 @@ class ApiClient {
       method: 'DELETE',
     });
   }
+
+  // 启动专栏批量导出(后台任务)
+  async exportGroupColumns(groupId: number | string): Promise<{
+    success: boolean;
+    task_id: string;
+    message: string;
+  }> {
+    return this.request(`/api/groups/${groupId}/columns/export`, {
+      method: 'POST',
+    });
+  }
+
+  // 查询最近一次专栏导出归档
+  async getColumnsExportLatest(groupId: number | string): Promise<{
+    available: boolean;
+    filename?: string;
+    size?: number;
+    created_at?: string;
+  }> {
+    return this.request(`/api/groups/${groupId}/columns/export/latest`);
+  }
+
+  // 专栏导出 ZIP 下载地址
+  getColumnsExportDownloadUrl(groupId: number | string): string {
+    return `${this.baseUrl}/api/groups/${groupId}/columns/export/download`;
+  }
 }
 
 // 专栏相关类型定义
