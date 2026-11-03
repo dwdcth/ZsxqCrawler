@@ -28,6 +28,7 @@ from starlette.background import BackgroundTask
 import uvicorn
 import mimetypes
 import random
+from pathlib import Path
 import time
 from urllib.parse import urlparse
 
@@ -78,6 +79,7 @@ from .zsxq_markdown_exporter import (
     write_temp_markdown_file,
     write_temp_topic_archive,
 )
+from .zsxq_columns_exporter import run_columns_export
 
 # 初始化日志系统
 ensure_configured()
@@ -5717,6 +5719,153 @@ async def export_column_topic_markdown(group_id: str, topic_id: str, format: str
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export Markdown failed: {str(e)}")
+
+
+def _get_columns_export_zip_dir() -> str:
+    exports_dir = os.path.join(project_root, "output", "exports")
+    os.makedirs(exports_dir, exist_ok=True)
+    return exports_dir
+
+
+def _find_latest_columns_export(group_id: str) -> Optional[str]:
+    exports_dir = _get_columns_export_zip_dir()
+    prefix = f"columns_{group_id}_"
+    candidates = [
+        os.path.join(exports_dir, name)
+        for name in os.listdir(exports_dir)
+        if name.startswith(prefix) and name.endswith(".zip")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: os.path.getmtime(p))
+
+
+def _export_columns_task(task_id: str, group_id: str):
+    """专栏批量导出后台任务:导出 Markdown 并打包 ZIP。
+
+    注意保持为同步函数:Starlette 会将其放入线程池执行,
+    导出过程中的阻塞 IO(抓文章/下载附件)不会卡住事件循环。
+    """
+    out_root = None
+    try:
+        update_task(task_id, "running", "正在导出专栏内容...")
+
+        cookie = get_cookie_for_group(group_id)
+        if not cookie:
+            raise Exception("未找到可用Cookie，请先配置账号")
+        headers = build_stealth_headers(cookie)
+
+        out_root = os.path.join(project_root, "output", f"columns_export_{group_id}")
+        if os.path.exists(out_root):
+            shutil.rmtree(out_root, ignore_errors=True)
+
+        stats = run_columns_export(
+            str(group_id),
+            Path(out_root),
+            cookie,
+            headers,
+            log=lambda msg: add_task_log(task_id, msg),
+            should_stop=lambda: task_stop_flags.get(task_id, False),
+        )
+
+        archive_root = f"columns_export_{group_id}"
+        manifest = _build_export_manifest(
+            "columns_export",
+            out_root,
+            archive_root,
+            [{"group_id": str(group_id), "path": out_root}],
+        )
+        zip_path = _zip_directory_with_manifest(out_root, archive_root, manifest)
+        final_zip = os.path.join(
+            _get_columns_export_zip_dir(),
+            f"columns_{group_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        )
+        shutil.move(zip_path, final_zip)
+
+        result = {
+            "zip_filename": os.path.basename(final_zip),
+            "zip_size": os.path.getsize(final_zip),
+            "download_url": f"/api/groups/{group_id}/columns/export/download",
+            "stats": stats,
+            "output_dir": out_root,
+        }
+        update_task(
+            task_id,
+            "completed",
+            f"导出完成: {stats['columns']} 个专栏, {stats['articles']} 篇文章"
+            f"(全文 {stats['fulltext_fetched']} 篇, 附件 {stats['files_downloaded']} 个)",
+            result,
+        )
+    except Exception as e:
+        update_task(task_id, "failed", f"导出失败: {str(e)}")
+        add_task_log(task_id, f"❌ 导出失败: {str(e)}")
+
+
+@app.post("/api/groups/{group_id}/columns/export")
+async def export_group_columns(group_id: str, background_tasks: BackgroundTasks):
+    """启动后台任务:将群组全部专栏导出为 Markdown 并打包为 ZIP"""
+    global task_counter
+    try:
+        if not group_id.isdigit():
+            raise HTTPException(status_code=400, detail="社群 ID 格式不正确")
+
+        path_manager = get_db_path_manager()
+        db_path = path_manager.get_columns_db_path(str(group_id))
+        if not os.path.exists(db_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"群组 {group_id} 本地专栏数据库不存在，请先采集专栏内容",
+            )
+
+        task_counter += 1
+        task_id = f"columns_export_{group_id}_{task_counter}"
+        current_tasks[task_id] = {
+            "task_id": task_id,
+            "type": "columns_export",
+            "group_id": group_id,
+            "status": "running",
+            "message": "正在导出专栏内容...",
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "result": None,
+        }
+        task_logs[task_id] = []
+        task_stop_flags[task_id] = False
+
+        background_tasks.add_task(_export_columns_task, task_id, group_id)
+
+        return {"success": True, "task_id": task_id, "message": "专栏导出任务已启动"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动专栏导出失败: {str(e)}")
+
+
+@app.get("/api/groups/{group_id}/columns/export/latest")
+async def get_latest_columns_export(group_id: str):
+    """查询最近一次专栏导出归档(用于页面提供历史下载)"""
+    zip_path = _find_latest_columns_export(group_id)
+    if not zip_path:
+        return {"available": False}
+    return {
+        "available": True,
+        "filename": os.path.basename(zip_path),
+        "size": os.path.getsize(zip_path),
+        "created_at": datetime.fromtimestamp(os.path.getmtime(zip_path)).isoformat(),
+    }
+
+
+@app.get("/api/groups/{group_id}/columns/export/download")
+async def download_columns_export(group_id: str):
+    """下载最近一次专栏导出的 ZIP 归档"""
+    zip_path = _find_latest_columns_export(group_id)
+    if not zip_path or not os.path.exists(zip_path):
+        raise HTTPException(status_code=404, detail="暂无可下载的专栏导出")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=os.path.basename(zip_path),
+    )
 
 
 @app.post("/api/groups/{group_id}/columns/fetch")

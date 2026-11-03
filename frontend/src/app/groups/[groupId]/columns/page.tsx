@@ -8,10 +8,10 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
-import { 
-  ArrowLeft, BookOpen, FileText, Download, RefreshCw, 
+import {
+  ArrowLeft, BookOpen, FileText, Download, RefreshCw,
   File, FileImage, Clock, Heart, MessageCircle,
-  Users, FolderOpen, Play, Settings, Trash2, Loader2
+  Users, FolderOpen, Play, Settings, Trash2, Loader2, FileDown
 } from 'lucide-react';
 import { apiClient, ColumnInfo, ColumnTopic, ColumnTopicDetail, ColumnsStats, ColumnsFetchSettings } from '@/lib/api';
 import { toast } from 'sonner';
@@ -61,6 +61,16 @@ export default function ColumnsPage() {
   const selectedTopicIdRef = useRef<string | null>(null);
   const columnsRefreshInFlightRef = useRef(false);
   const topicsRefreshInFlightRef = useRef(false);
+
+  // 专栏批量导出
+  const [exporting, setExporting] = useState(false);
+  const [exportTaskId, setExportTaskId] = useState<string | null>(null);
+  const [latestExport, setLatestExport] = useState<{
+    available: boolean;
+    filename?: string;
+    size?: number;
+    created_at?: string;
+  } | null>(null);
 
   useEffect(() => {
     selectedColumnIdRef.current = selectedColumn?.column_id ?? null;
@@ -297,6 +307,74 @@ export default function ColumnsPage() {
     }
   };
 
+  // 查询最近一次导出归档
+  const loadLatestExport = useCallback(async () => {
+    try {
+      const result = await apiClient.getColumnsExportLatest(groupId);
+      setLatestExport(result);
+    } catch (error) {
+      // 静默失败,不影响页面
+      console.warn('查询专栏导出归档失败:', error);
+    }
+  }, [groupId]);
+
+  // 批量导出专栏为 Markdown
+  const handleExportColumns = async () => {
+    try {
+      setExporting(true);
+
+      const result = await apiClient.exportGroupColumns(groupId);
+      if (result.success) {
+        setExportTaskId(result.task_id);
+        setCurrentTaskId(result.task_id); // 日志面板展示导出进度
+        toast.success('专栏导出任务已启动，长文章全文抓取需要一些时间');
+      } else {
+        setExporting(false);
+        toast.error(result.message || '启动专栏导出失败');
+      }
+    } catch (error) {
+      console.error('启动专栏导出失败:', error);
+      toast.error(error instanceof Error ? error.message : '启动专栏导出失败');
+      setExporting(false);
+    }
+  };
+
+  // 轮询导出任务状态
+  useEffect(() => {
+    if (!exportTaskId) {
+      return;
+    }
+
+    let stopped = false;
+
+    const checkExportTask = async () => {
+      if (stopped || document.visibilityState !== 'visible') {
+        return;
+      }
+      try {
+        const task = await apiClient.getTask(exportTaskId);
+        if (task.status === 'completed') {
+          setExporting(false);
+          setExportTaskId(null);
+          toast.success(task.message || '专栏导出完成');
+          await loadLatestExport();
+        } else if (task.status === 'failed' || task.status === 'cancelled') {
+          setExporting(false);
+          setExportTaskId(null);
+          toast.error(task.message || '专栏导出失败');
+        }
+      } catch (error) {
+        console.warn('检查专栏导出任务状态失败:', error);
+      }
+    };
+
+    const intervalId = window.setInterval(checkExportTask, 3000);
+    return () => {
+      stopped = true;
+      window.clearInterval(intervalId);
+    };
+  }, [exportTaskId, loadLatestExport]);
+
   // 删除所有专栏数据
   const handleDeleteAllColumns = async () => {
     try {
@@ -375,6 +453,10 @@ export default function ColumnsPage() {
   useEffect(() => {
     loadColumns();
   }, [loadColumns]);
+
+  useEffect(() => {
+    loadLatestExport();
+  }, [loadLatestExport]);
 
   useEffect(() => {
     if (!fetchingColumns && !currentTaskId) {
@@ -1003,11 +1085,43 @@ export default function ColumnsPage() {
           </div>
           
           <div className="flex items-center gap-3">
-            {(fetchingColumns || currentTaskId) && (
+            {(fetchingColumns || currentTaskId) && !exporting && (
               <Badge variant="outline" className="h-8 gap-1.5 text-amber-700 border-amber-200 bg-amber-50">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 自动刷新中
               </Badge>
+            )}
+            {exporting && (
+              <Badge variant="outline" className="h-8 gap-1.5 text-emerald-700 border-emerald-200 bg-emerald-50">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                导出中
+              </Badge>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleExportColumns}
+              disabled={exporting || !stats || stats.columns_count === 0}
+              className="flex items-center gap-2"
+              title="将全部专栏导出为 Markdown(含长文章全文与附件)并打包为 ZIP"
+            >
+              {exporting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <FileDown className="h-4 w-4" />
+              )}
+              导出专栏
+            </Button>
+            {latestExport?.available && (
+              <a
+                href={apiClient.getColumnsExportDownloadUrl(groupId)}
+                download={latestExport.filename}
+                className="inline-flex items-center gap-2 rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground h-8 px-3 text-sm font-medium transition-colors"
+                title={latestExport.filename}
+              >
+                <Download className="h-4 w-4" />
+                下载导出
+              </a>
             )}
             <Button
               variant="outline"
