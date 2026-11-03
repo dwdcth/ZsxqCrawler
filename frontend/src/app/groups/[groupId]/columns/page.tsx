@@ -72,6 +72,16 @@ export default function ColumnsPage() {
     created_at?: string;
   } | null>(null);
 
+  // 专栏 PDF 导出
+  const [pdfExporting, setPdfExporting] = useState(false);
+  const [pdfTaskId, setPdfTaskId] = useState<string | null>(null);
+  const [latestPdfExport, setLatestPdfExport] = useState<{
+    available: boolean;
+    filename?: string;
+    size?: number;
+    created_at?: string;
+  } | null>(null);
+
   useEffect(() => {
     selectedColumnIdRef.current = selectedColumn?.column_id ?? null;
   }, [selectedColumn]);
@@ -375,6 +385,64 @@ export default function ColumnsPage() {
     };
   }, [exportTaskId, loadLatestExport]);
 
+  // 批量导出专栏为 PDF
+  const handleExportPdf = async () => {
+    try {
+      setPdfExporting(true);
+
+      const result = await apiClient.exportGroupColumnsPdf(groupId);
+      if (result.success) {
+        setPdfTaskId(result.task_id);
+        setCurrentTaskId(result.task_id); // 日志面板展示渲染进度
+        toast.success('专栏 PDF 导出任务已启动');
+      } else {
+        setPdfExporting(false);
+        toast.error(result.message || '启动专栏 PDF 导出失败');
+      }
+    } catch (error) {
+      console.error('启动专栏 PDF 导出失败:', error);
+      toast.error(error instanceof Error ? error.message : '启动专栏 PDF 导出失败');
+      setPdfExporting(false);
+    }
+  };
+
+  // 轮询 PDF 导出任务状态
+  useEffect(() => {
+    if (!pdfTaskId) {
+      return;
+    }
+
+    let stopped = false;
+
+    const checkPdfTask = async () => {
+      if (stopped || document.visibilityState !== 'visible') {
+        return;
+      }
+      try {
+        const task = await apiClient.getTask(pdfTaskId);
+        if (task.status === 'completed') {
+          setPdfExporting(false);
+          setPdfTaskId(null);
+          toast.success(task.message || '专栏 PDF 导出完成');
+          const latest = await apiClient.getColumnsPdfExportLatest(groupId);
+          setLatestPdfExport(latest);
+        } else if (task.status === 'failed' || task.status === 'cancelled') {
+          setPdfExporting(false);
+          setPdfTaskId(null);
+          toast.error(task.message || '专栏 PDF 导出失败');
+        }
+      } catch (error) {
+        console.warn('检查专栏 PDF 导出任务状态失败:', error);
+      }
+    };
+
+    const intervalId = window.setInterval(checkPdfTask, 3000);
+    return () => {
+      stopped = true;
+      window.clearInterval(intervalId);
+    };
+  }, [pdfTaskId, groupId]);
+
   // 删除所有专栏数据
   const handleDeleteAllColumns = async () => {
     try {
@@ -457,6 +525,13 @@ export default function ColumnsPage() {
   useEffect(() => {
     loadLatestExport();
   }, [loadLatestExport]);
+
+  // 页面加载时查询最近一次 PDF 导出归档
+  useEffect(() => {
+    apiClient.getColumnsPdfExportLatest(groupId)
+      .then(setLatestPdfExport)
+      .catch((error) => console.warn('查询专栏 PDF 导出归档失败:', error));
+  }, [groupId]);
 
   useEffect(() => {
     if (!fetchingColumns && !currentTaskId) {
@@ -1085,7 +1160,7 @@ export default function ColumnsPage() {
           </div>
           
           <div className="flex items-center gap-3">
-            {(fetchingColumns || currentTaskId) && !exporting && (
+            {(fetchingColumns || currentTaskId) && !exporting && !pdfExporting && (
               <Badge variant="outline" className="h-8 gap-1.5 text-amber-700 border-amber-200 bg-amber-50">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 自动刷新中
@@ -1097,11 +1172,17 @@ export default function ColumnsPage() {
                 导出中
               </Badge>
             )}
+            {pdfExporting && (
+              <Badge variant="outline" className="h-8 gap-1.5 text-rose-700 border-rose-200 bg-rose-50">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                PDF 渲染中
+              </Badge>
+            )}
             <Button
               variant="outline"
               size="sm"
               onClick={handleExportColumns}
-              disabled={exporting || !stats || stats.columns_count === 0}
+              disabled={exporting || pdfExporting || !stats || stats.columns_count === 0}
               className="flex items-center gap-2"
               title="将全部专栏导出为 Markdown(含长文章全文与附件)并打包为 ZIP"
             >
@@ -1121,6 +1202,32 @@ export default function ColumnsPage() {
               >
                 <Download className="h-4 w-4" />
                 下载导出
+              </a>
+            )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleExportPdf}
+              disabled={pdfExporting || exporting || !stats || stats.columns_count === 0}
+              className="flex items-center gap-2"
+              title="将全部专栏合并渲染为 PDF(每专栏一个文件)并打包为 ZIP"
+            >
+              {pdfExporting ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <FileText className="h-4 w-4" />
+              )}
+              导出PDF
+            </Button>
+            {latestPdfExport?.available && (
+              <a
+                href={apiClient.getColumnsPdfDownloadUrl(groupId)}
+                download={latestPdfExport.filename}
+                className="inline-flex items-center gap-2 rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground h-8 px-3 text-sm font-medium transition-colors"
+                title={latestPdfExport.filename}
+              >
+                <Download className="h-4 w-4" />
+                下载PDF
               </a>
             )}
             <Button

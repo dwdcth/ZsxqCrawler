@@ -1022,6 +1022,32 @@ class ApiClient {
   getColumnsExportDownloadUrl(groupId: number | string): string {
     return `${this.baseUrl}/api/groups/${groupId}/columns/export/download`;
   }
+
+  // 启动专栏 PDF 导出(后台任务)
+  async exportGroupColumnsPdf(groupId: number | string): Promise<{
+    success: boolean;
+    task_id: string;
+    message: string;
+  }> {
+    return this.request(`/api/groups/${groupId}/columns/export-pdf`, {
+      method: 'POST',
+    });
+  }
+
+  // 查询最近一次专栏 PDF 导出归档
+  async getColumnsPdfExportLatest(groupId: number | string): Promise<{
+    available: boolean;
+    filename?: string;
+    size?: number;
+    created_at?: string;
+  }> {
+    return this.request(`/api/groups/${groupId}/columns/export-pdf/latest`);
+  }
+
+  // 专栏 PDF 导出 ZIP 下载地址
+  getColumnsPdfDownloadUrl(groupId: number | string): string {
+    return `${this.baseUrl}/api/groups/${groupId}/columns/export-pdf/download`;
+  }
 }
 
 // 专栏相关类型定义

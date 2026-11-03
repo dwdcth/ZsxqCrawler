@@ -80,6 +80,7 @@ from .zsxq_markdown_exporter import (
     write_temp_topic_archive,
 )
 from .zsxq_columns_exporter import run_columns_export
+from .zsxq_pdf_exporter import export_group_pdfs
 
 # 初始化日志系统
 ensure_configured()
@@ -5861,6 +5862,170 @@ async def download_columns_export(group_id: str):
     zip_path = _find_latest_columns_export(group_id)
     if not zip_path or not os.path.exists(zip_path):
         raise HTTPException(status_code=404, detail="暂无可下载的专栏导出")
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=os.path.basename(zip_path),
+    )
+
+
+def _find_latest_columns_pdf_export(group_id: str) -> Optional[str]:
+    exports_dir = _get_columns_export_zip_dir()
+    prefix = f"columns_pdf_{group_id}_"
+    candidates = [
+        os.path.join(exports_dir, name)
+        for name in os.listdir(exports_dir)
+        if name.startswith(prefix) and name.endswith(".zip")
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: os.path.getmtime(p))
+
+
+def _export_columns_pdf_task(task_id: str, group_id: str):
+    """专栏 PDF 导出后台任务:Markdown 缺失时先补采,再逐专栏渲染并打包 ZIP。
+
+    保持为同步函数:Starlette 将其放入线程池执行,渲染期间的阻塞 IO
+    不会卡住事件循环。
+    """
+    try:
+        update_task(task_id, "running", "正在准备专栏数据...")
+
+        # PDF 依赖 Markdown 产物;缺失时先补一次完整导出(含长文章全文抓取)
+        md_export_dir = Path(project_root, "output", f"columns_export_{group_id}")
+        if not md_export_dir.exists():
+            add_task_log(task_id, "📥 本地无专栏 Markdown,先执行完整导出(长文章需抓取全文)...")
+            cookie = get_cookie_for_group(group_id)
+            if not cookie:
+                raise Exception("未找到可用Cookie，请先配置账号")
+            headers = build_stealth_headers(cookie)
+            stats = run_columns_export(
+                str(group_id),
+                md_export_dir,
+                cookie,
+                headers,
+                log=lambda msg: add_task_log(task_id, msg),
+                should_stop=lambda: task_stop_flags.get(task_id, False),
+            )
+            add_task_log(task_id, f"✅ Markdown 导出完成: {stats['articles']} 篇")
+        else:
+            add_task_log(task_id, "📄 检测到已有专栏 Markdown,直接渲染 PDF")
+
+        update_task(task_id, "running", "正在渲染 PDF...")
+        prefix = f"群组{group_id}"
+        group_name = ""
+        try:
+            meta_path = Path(project_root, "output", "databases", str(group_id), "group_meta.json")
+            if meta_path.exists():
+                group_name = (json.loads(meta_path.read_text(encoding="utf-8")) or {}).get("name", "")
+        except (json.JSONDecodeError, OSError):
+            pass
+        if group_name:
+            prefix = group_name
+
+        pdf_out_dir = Path(project_root, "output", f"columns_pdf_{group_id}")
+        if pdf_out_dir.exists():
+            shutil.rmtree(pdf_out_dir, ignore_errors=True)
+
+        result = export_group_pdfs(
+            md_export_dir,
+            pdf_out_dir,
+            prefix,
+            log=lambda msg: add_task_log(task_id, msg),
+            should_stop=lambda: task_stop_flags.get(task_id, False),
+        )
+
+        archive_root = f"columns_pdf_{group_id}"
+        manifest = _build_export_manifest(
+            "columns_pdf_export",
+            str(pdf_out_dir),
+            archive_root,
+            [{"group_id": str(group_id), "path": str(pdf_out_dir)}],
+        )
+        zip_path = _zip_directory_with_manifest(str(pdf_out_dir), archive_root, manifest)
+        final_zip = os.path.join(
+            _get_columns_export_zip_dir(),
+            f"columns_pdf_{group_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        )
+        shutil.move(zip_path, final_zip)
+
+        task_result = {
+            "zip_filename": os.path.basename(final_zip),
+            "zip_size": os.path.getsize(final_zip),
+            "download_url": f"/api/groups/{group_id}/columns/export-pdf/download",
+            "stats": result,
+        }
+        update_task(
+            task_id,
+            "completed",
+            f"PDF 导出完成: {len(result['pdfs'])} 个文件, 合计 {result['total_mb']} MB",
+            task_result,
+        )
+    except Exception as e:
+        update_task(task_id, "failed", f"PDF 导出失败: {str(e)}")
+        add_task_log(task_id, f"❌ PDF 导出失败: {str(e)}")
+
+
+@app.post("/api/groups/{group_id}/columns/export-pdf")
+async def export_group_columns_pdf(group_id: str, background_tasks: BackgroundTasks):
+    """启动后台任务:将群组全部专栏渲染为 PDF 并打包为 ZIP"""
+    global task_counter
+    try:
+        if not group_id.isdigit():
+            raise HTTPException(status_code=400, detail="社群 ID 格式不正确")
+
+        path_manager = get_db_path_manager()
+        db_path = path_manager.get_columns_db_path(str(group_id))
+        if not os.path.exists(db_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"群组 {group_id} 本地专栏数据库不存在，请先采集专栏内容",
+            )
+
+        task_counter += 1
+        task_id = f"columns_pdf_{group_id}_{task_counter}"
+        current_tasks[task_id] = {
+            "task_id": task_id,
+            "type": "columns_pdf_export",
+            "group_id": group_id,
+            "status": "running",
+            "message": "正在渲染 PDF...",
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+            "result": None,
+        }
+        task_logs[task_id] = []
+        task_stop_flags[task_id] = False
+
+        background_tasks.add_task(_export_columns_pdf_task, task_id, group_id)
+
+        return {"success": True, "task_id": task_id, "message": "专栏 PDF 导出任务已启动"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"启动专栏 PDF 导出失败: {str(e)}")
+
+
+@app.get("/api/groups/{group_id}/columns/export-pdf/latest")
+async def get_latest_columns_pdf_export(group_id: str):
+    """查询最近一次专栏 PDF 导出归档"""
+    zip_path = _find_latest_columns_pdf_export(group_id)
+    if not zip_path:
+        return {"available": False}
+    return {
+        "available": True,
+        "filename": os.path.basename(zip_path),
+        "size": os.path.getsize(zip_path),
+        "created_at": datetime.fromtimestamp(os.path.getmtime(zip_path)).isoformat(),
+    }
+
+
+@app.get("/api/groups/{group_id}/columns/export-pdf/download")
+async def download_columns_pdf_export(group_id: str):
+    """下载最近一次专栏 PDF 导出的 ZIP 归档"""
+    zip_path = _find_latest_columns_pdf_export(group_id)
+    if not zip_path or not os.path.exists(zip_path):
+        raise HTTPException(status_code=404, detail="暂无可下载的专栏 PDF 导出")
     return FileResponse(
         zip_path,
         media_type="application/zip",
